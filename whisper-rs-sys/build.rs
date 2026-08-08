@@ -351,8 +351,13 @@ fn main() {
     // Android therefore asked for -lggml-blas, which CMake correctly never
     // builds there, and the link failed with "could not find native static
     // library `ggml-blas`". CARGO_CFG_TARGET_OS is the target.
+    //
+    // Every Apple target has Accelerate, so CMake builds ggml-blas for all of
+    // them and ggml-backend-reg references ggml_backend_blas_reg. Matching only
+    // "macos" left that symbol undefined on an iOS device build.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if (target_os == "macos" || cfg!(feature = "openblas")) && system_ggml_dir.is_none() {
+    let apple = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "watchos" | "visionos");
+    if (apple || cfg!(feature = "openblas")) && system_ggml_dir.is_none() {
         println!("cargo:rustc-link-lib=static=ggml-blas");
     }
     if cfg!(feature = "vulkan") {
