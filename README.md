@@ -1,7 +1,8 @@
 # vendor — patched third-party crates for Aria
 
-Two `-sys` crates, patched so whisper.cpp and llama.cpp can live in the same
-binary. `aria-ai-core` references them via `[patch.crates-io]`.
+Three `-sys` crates. Two are patched so whisper.cpp and llama.cpp can live in
+the same binary; `sherpa-rs-sys` is patched to build under Cargo 1.100's
+build-dir layout. `aria-ai-core` references them via `[patch.crates-io]`.
 
 ## Why
 
@@ -53,6 +54,23 @@ compile with `--cap-lints allow`, but a `[patch]` path dependency does not, so
 our `-Dwarnings` would otherwise apply this project's lint policy to upstream
 code. Our own crates are unaffected.
 
+**sherpa-rs-sys** — its build script copied the prebuilt onnxruntime and
+sherpa-onnx dylibs into `target/<profile>/deps`, finding that directory by
+walking up from `OUT_DIR` to the first ancestor named after `$PROFILE`, and
+panicked if the copy failed. Cargo 1.100's build-dir layout no longer creates
+`target/<profile>/deps`, so every build with the `download-binaries` default
+failed with `Failed to copy ... to .../target/debug/deps/libonnxruntime.1.17.1.dylib`.
+
+1. The dylibs are now copied into `$OUT_DIR/lib`, which Cargo defines and which
+   the script already emits as a `rustc-link-search` path. Because it is inside
+   the target dir, Cargo puts it on the dynamic-library search path for
+   `cargo test` / `cargo run`, so nothing depends on Cargo's private layout.
+2. Copies next to final artifacts (`target/<profile>`, `examples`, `deps`) are
+   kept for running binaries outside Cargo, but only into directories that
+   exist, and a failure is a `cargo:warning` instead of a panic. Locating
+   `target/<profile>` returns `None` instead of `unwrap()`ing when the
+   ancestor walk finds nothing (custom profiles, a separate `build.build-dir`).
+
 ## Verified
 
 With the patches, `aria-ai-core --features stt-whisper-with-llm` links on the
@@ -64,6 +82,7 @@ two).
 
 - `llama-cpp-sys-2` — https://github.com/utilityai/llama-cpp-rs
 - `whisper-rs-sys` — https://codeberg.org/tazz4843/whisper-rs
+- `sherpa-rs-sys` — https://github.com/thewh1teagle/sherpa-rs
 
 Sources are the crates.io packages (which already embed the C++ trees) rather
 than git checkouts, so no submodule fetch is needed. On a version bump, re-apply
