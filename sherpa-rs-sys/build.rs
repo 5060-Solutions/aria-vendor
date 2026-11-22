@@ -1,3 +1,8 @@
+// PATCH (aria): crates from the registry build with `--cap-lints allow`, but a
+// `[patch]` path dependency does not, so aria-ai-core's `-Dwarnings` would
+// otherwise apply to upstream code.
+#![allow(warnings)]
+
 use cmake::Config;
 use glob::glob;
 use std::collections::HashMap;
@@ -46,28 +51,35 @@ fn add_search_path<P: AsRef<Path>>(path: P) {
     println!("cargo:rustc-link-search={}", path.as_ref().display());
 }
 
-fn copy_file(src: PathBuf, dst: PathBuf) {
-    if let Err(err) = std::fs::hard_link(&src, &dst) {
-        debug_log!("Failed to hardlink {:?}. fallback to copy.", err);
-        fs::copy(&src, &dst)
-            .unwrap_or_else(|_| panic!("Failed to copy {} to {}", src.display(), dst.display()));
-    }
+// PATCH (aria): best-effort only. Upstream walked up from OUT_DIR to the first
+// ancestor named after $PROFILE and treated it as `target/<profile>`, then
+// unwrap()ed. That is a guess about Cargo's private directory layout: it is
+// wrong when `build.build-dir` lives outside the target dir, and it finds
+// nothing for custom profiles. The result is now only used for convenience
+// copies next to final artifacts; nothing the build depends on goes there.
+fn get_cargo_target_dir() -> Option<PathBuf> {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR")?);
+    let profile = env::var("PROFILE").ok()?;
+    out_dir
+        .ancestors()
+        .skip(1)
+        .find(|p| p.ends_with(&profile))
+        .map(Path::to_path_buf)
 }
 
-fn get_cargo_target_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-    let profile = std::env::var("PROFILE")?;
-    let mut target_dir = None;
-    let mut sub_path = out_dir.as_path();
-    while let Some(parent) = sub_path.parent() {
-        if parent.ends_with(&profile) {
-            target_dir = Some(parent);
-            break;
-        }
-        sub_path = parent;
+// PATCH (aria): copy that reports failure instead of panicking, for the
+// convenience copies whose destination may legitimately not exist.
+fn try_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.exists() {
+        return Ok(());
     }
-    let target_dir = target_dir.ok_or("not found")?;
-    Ok(target_dir.to_path_buf())
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::hard_link(src, dst).is_err() {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
 }
 
 fn delete_folder(src: &Path) -> std::io::Result<()> {
@@ -269,7 +281,7 @@ fn main() {
     debug_log!("TARGET: {:?}", target);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let target_dir = get_cargo_target_dir().unwrap();
+    let target_dir = get_cargo_target_dir();
     let sherpa_dst = out_dir.join("sherpa-onnx");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
     let sherpa_src = Path::new(&manifest_dir).join("sherpa-onnx");
@@ -288,7 +300,7 @@ fn main() {
 
     debug_log!("TARGET: {}", target);
     debug_log!("CARGO_MANIFEST_DIR: {}", manifest_dir);
-    debug_log!("TARGET_DIR: {}", target_dir.display());
+    debug_log!("TARGET_DIR: {:?}", target_dir);
     debug_log!("OUT_DIR: {}", out_dir.display());
 
     // Prepare sherpa-onnx source
@@ -545,30 +557,60 @@ fn main() {
             }
         }
 
+        // PATCH (aria): Cargo 1.100's build-dir layout no longer creates
+        // `target/<profile>/deps` (intermediate artifacts moved under
+        // `build/<pkg>/<hash>/`), so upstream's unconditional copy into it
+        // panicked and failed the build. The libraries now go into
+        // `$OUT_DIR/lib`, which Cargo defines for us and which is already a
+        // `rustc-link-search` path inside the target dir. Cargo puts such paths
+        // on the dynamic-library search path for `cargo run` / `cargo test`,
+        // so binaries find them without relying on any layout guess.
+        //
+        // Copies next to final artifacts (`target/<profile>`, `examples`,
+        // legacy `deps`) are kept for running binaries outside Cargo, but are
+        // best-effort: only into directories that exist, with a warning
+        // rather than a panic when they fail.
+        let out_lib = out_dir.join("lib");
+        fs::create_dir_all(&out_lib)
+            .unwrap_or_else(|e| panic!("Failed to create {}: {}", out_lib.display(), e));
+
         for asset in libs_assets {
-            let asset_clone = asset.clone();
-            let filename = asset_clone.file_name().unwrap();
-            let filename = filename.to_str().unwrap();
-            let dst = target_dir.join(filename);
-            // debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                copy_file(asset.clone(), dst);
+            let Some(filename) = asset.file_name() else {
+                continue;
+            };
+
+            let dst = out_lib.join(filename);
+            if asset != dst {
+                try_copy_file(&asset, &dst).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to copy {} to {}: {}",
+                        asset.display(),
+                        dst.display(),
+                        e
+                    )
+                });
             }
 
-            // Copy DLLs to examples as well
-            if target_dir.join("examples").exists() {
-                let dst = target_dir.join("examples").join(filename);
-                // debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-                if !dst.exists() {
-                    copy_file(asset.clone(), dst);
+            let Some(target_dir) = target_dir.as_deref() else {
+                continue;
+            };
+            for dir in [
+                target_dir.to_path_buf(),
+                target_dir.join("examples"),
+                target_dir.join("deps"),
+            ] {
+                if !dir.is_dir() {
+                    continue;
                 }
-            }
-
-            // Copy DLLs to target/profile/deps as well for tests
-            let dst = target_dir.join("deps").join(filename);
-            // debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                copy_file(asset.clone(), dst);
+                let dst = dir.join(filename);
+                if let Err(e) = try_copy_file(&asset, &dst) {
+                    println!(
+                        "cargo:warning=Could not copy {} to {}: {}",
+                        asset.display(),
+                        dst.display(),
+                        e
+                    );
+                }
             }
         }
 
